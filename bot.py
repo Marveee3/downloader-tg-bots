@@ -1,174 +1,257 @@
-import os
-import logging
 import asyncio
-import subprocess
+import logging
+import os
+import re
 import shutil
+import subprocess
+import tempfile
+import time
 from pathlib import Path
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from urllib.parse import urlparse
+
 import yt_dlp
-
-# ================= 配置 =================
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # 从环境变量读取，不要硬编码
-DOWNLOAD_DIR = Path("downloads")
-DOWNLOAD_DIR.mkdir(exist_ok=True)
-
-# 日志
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
-logger = logging.getLogger(__name__)
 
-# ================= 核心功能 =================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+COOKIES_B64 = os.getenv("YTDLP_COOKIES_B64", "").strip()
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "49"))
+MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "700"))
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/tmp/video-bot-downloads"))
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-def _download_video_sync(url: str) -> dict:
-    """同步下载函数（将在异步环境中用线程调用）"""
-    ydl_opts = {
-        "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("video_bot")
+
+# Avoid two simultaneous downloads exhausting a small Railway instance.
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(1)
+
+
+def valid_http_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
+def prepare_cookie_file() -> str | None:
+    """Use a mounted cookies file, or decode a Base64 Netscape-format file."""
+    if COOKIES_FILE:
+        path = Path(COOKIES_FILE)
+        if path.is_file():
+            return str(path)
+        logger.warning("YTDLP_COOKIES_FILE is set, but the file does not exist.")
+    if COOKIES_B64:
+        import base64
+        path = Path("/tmp/yt-dlp-cookies.txt")
+        try:
+            path.write_bytes(base64.b64decode(COOKIES_B64, validate=True))
+            return str(path)
+        except Exception:
+            logger.exception("Could not decode YTDLP_COOKIES_B64.")
+    return None
+
+
+def download_sync(url: str, job_dir: Path) -> dict:
+    cookie_file = prepare_cookie_file()
+    opts = {
+        "outtmpl": str(job_dir / "%(id)s.%(ext)s"),
+        "format": "best[ext=mp4]/best",
         "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
         "noplaylist": True,
-        # 可选：限制文件大小，避免下载超大文件
-        # "max_filesize": 500 * 1024 * 1024,  # 500MB
+        "quiet": True,
+        "no_warnings": False,
+        "retries": 2,
+        "fragment_retries": 2,
+        "socket_timeout": 30,
+        "max_filesize": MAX_DOWNLOAD_MB * 1024 * 1024,
+        "restrictfilenames": True,
+        "overwrites": True,
+        "logger": YtDlpLogger(),
     }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    if cookie_file:
+        opts["cookiefile"] = cookie_file
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        # 获取实际下载的文件路径
-        filepath = ydl.prepare_filename(info)
-        # 如果合并后扩展名可能变化，尝试查找
-        if not Path(filepath).exists():
-            # 查找匹配的 mp4 文件
-            candidates = list(DOWNLOAD_DIR.glob(f"{info['title']}*.mp4"))
-            if candidates:
-                filepath = str(candidates[0])
+        expected = Path(ydl.prepare_filename(info))
+        candidates = [expected]
+        # yt-dlp can change extension when merging formats.
+        if expected.suffix.lower() != ".mp4":
+            candidates.append(expected.with_suffix(".mp4"))
+        candidates.extend(p for p in job_dir.iterdir() if p.is_file())
+        filepath = next((p for p in candidates if p.is_file()), None)
+        if filepath is None:
+            raise RuntimeError("Загрузчик завершился, но файл не найден.")
+        size = filepath.stat().st_size
+        if size > MAX_DOWNLOAD_MB * 1024 * 1024:
+            raise RuntimeError(f"Видео больше лимита загрузки ({MAX_DOWNLOAD_MB} МБ).")
         return {
-            "filepath": filepath,
-            "title": info.get("title", "video"),
-            "filesize": os.path.getsize(filepath) if os.path.exists(filepath) else 0,
+            "filepath": str(filepath),
+            "title": info.get("title") or "video",
+            "duration": info.get("duration"),
+            "size": size,
         }
 
 
-def _compress_if_needed(filepath: str) -> str:
-    """如果文件超过 50MB，用 FFmpeg 压缩到 480p 左右"""
-    size_mb = os.path.getsize(filepath) / (1024 * 1024)
-    if size_mb <= 50:
-        return filepath
-    
-    logger.info(f"文件 {size_mb:.1f}MB，开始压缩...")
-    compressed_path = filepath.rsplit(".", 1)[0] + "_compressed.mp4"
-    
-    # 简单压缩：缩放宽度到 854（480p），降低码率
+class YtDlpLogger:
+    def debug(self, msg):
+        # yt-dlp sends routine progress through debug; don't log cookies or URLs.
+        if msg.startswith("[debug]"):
+            logger.debug("yt-dlp %s", msg[:500])
+
+    def warning(self, msg):
+        logger.warning("yt-dlp: %s", msg[:700])
+
+    def error(self, msg):
+        logger.error("yt-dlp: %s", msg[:1000])
+
+
+def compress_sync(input_path: str, output_path: str) -> str:
+    """Try to make a Telegram-friendly MP4; return original if compression fails."""
+    if not shutil.which("ffmpeg"):
+        logger.warning("FFmpeg not found; cannot compress oversized video.")
+        return input_path
+
     cmd = [
-        "ffmpeg", "-i", filepath,
-        "-vf", "scale=854:-2",
-        "-c:v", "libx264", "-crf", "28", "-preset", "fast",
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", input_path,
+        "-vf", "scale='min(854,iw)':-2",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "29",
         "-c:a", "aac", "-b:a", "96k",
-        "-y", compressed_path
+        "-movflags", "+faststart",
+        output_path,
     ]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=600)
-        # 删除原文件，返回压缩后路径
-        os.remove(filepath)
-        return compressed_path
-    except Exception as e:
-        logger.error(f"压缩失败: {e}")
-        return filepath  # 压缩失败则返回原文件，让 Telegram 报错
+        subprocess.run(cmd, check=True, capture_output=True, timeout=900)
+        if Path(output_path).is_file() and Path(output_path).stat().st_size > 0:
+            return output_path
+    except Exception:
+        logger.exception("FFmpeg compression failed.")
+    return input_path
 
 
-# ================= 异步封装 =================
+def friendly_error(exc: Exception) -> str:
+    message = str(exc).lower()
+    if "redirection detected" in message:
+        return (
+            "Сайт перенаправил запрос. Видео может быть удалено, требовать входа "
+            "или быть недоступно с Railway. Проверь ссылку в браузере; если она "
+            "доступна только после входа, настрой cookies."
+        )
+    if "sign in to confirm" in message or "cookies" in message and "login" in message:
+        return "Сайт требует авторизацию. Для разрешённого доступа настрой cookies в Railway."
+    if "private video" in message or "video unavailable" in message or "this video is unavailable" in message:
+        return "Видео недоступно, удалено, приватное или ограничено владельцем."
+    if "unsupported url" in message:
+        return "Этот URL не поддерживается yt-dlp или ссылка имеет неверный формат."
+    if "max-filesize" in message or "file is larger than" in message:
+        return f"Видео превышает лимит загрузки {MAX_DOWNLOAD_MB} МБ."
+    return "Не удалось скачать видео. Проверь ссылку и логи Railway для подробностей."
 
-async def download_video(url: str) -> dict:
-    """在线程中执行同步下载，避免阻塞事件循环"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _download_video_sync, url)
-
-
-async def compress_video(filepath: str) -> str:
-    """在线程中执行压缩"""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _compress_if_needed, filepath)
-
-
-# ================= 命令处理 =================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 发送视频链接给我，我会下载并发送给你。\n"
-        "支持 YouTube、Twitter、Instagram 等 yt-dlp 支持的站点。\n"
-        "⚠️ 超过 50MB 的视频会自动压缩。"
+    await update.effective_message.reply_text(
+        "Привет! Пришли ссылку на видео с сайта, который поддерживает yt-dlp.\n"
+        f"Максимальный размер исходного файла: {MAX_DOWNLOAD_MB} МБ.\n"
+        "Скачивание работает только для контента, к которому у тебя есть доступ."
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "Отправь полную http/https-ссылку на видео. Если сайт требует авторизацию, "
+        "можно задать cookies через переменные Railway. Не отправляй cookies или "
+        "пароли в чат с ботом."
     )
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    if not url.startswith(("http://", "https://")):
-        await update.message.reply_text("请发送有效的链接。")
+    message = update.effective_message
+    if not message or not message.text:
         return
-    
-    status_msg = await update.message.reply_text("⏳ 正在解析并下载...")
-    
+
+    url = message.text.strip()
+    if not valid_http_url(url):
+        await message.reply_text("Пришли корректную ссылку, начинающуюся с http:// или https://.")
+        return
+
+    status = await message.reply_text("⏳ Проверяю ссылку и загружаю видео…")
+    job_dir = Path(tempfile.mkdtemp(prefix="job_", dir=DOWNLOAD_DIR))
     try:
-        # 1. 下载
-        await status_msg.edit_text("📥 下载中...")
-        result = await download_video(url)
-        filepath = result["filepath"]
-        title = result["title"]
-        
-        if not os.path.exists(filepath):
-            await status_msg.edit_text("❌ 下载失败：文件未找到。")
-            return
-        
-        # 2. 检查并压缩
-        await status_msg.edit_text("📦 检查文件大小...")
-        final_path = await compress_video(filepath)
-        
-        # 3. 发送
-        await status_msg.edit_text("📤 上传中...")
-        with open(final_path, "rb") as f:
-            await update.message.reply_video(
-                video=f,
-                caption=title[:1024],
-                supports_streaming=True,
-                read_timeout=120,
-                write_timeout=120,
-            )
-        
-        await status_msg.delete()
-        
-        # 4. 清理临时文件
+        async with DOWNLOAD_SEMAPHORE:
+            await status.edit_text("📥 Загружаю видео…")
+            result = await asyncio.to_thread(download_sync, url, job_dir)
+            final_path = result["filepath"]
+
+            size_mb = Path(final_path).stat().st_size / (1024 * 1024)
+            if size_mb > MAX_UPLOAD_MB:
+                await status.edit_text(
+                    f"📦 Файл {size_mb:.1f} МБ — пытаюсь сжать для отправки…"
+                )
+                compressed = str(job_dir / "compressed.mp4")
+                final_path = await asyncio.to_thread(compress_sync, final_path, compressed)
+
+            final_size = Path(final_path).stat().st_size
+            if final_size > MAX_UPLOAD_MB * 1024 * 1024:
+                await status.edit_text(
+                    f"❌ Файл всё ещё больше лимита отправки ({MAX_UPLOAD_MB} МБ). "
+                    "Попробуй видео меньшего качества."
+                )
+                return
+
+            await status.edit_text("📤 Отправляю видео в Telegram…")
+            with open(final_path, "rb") as video:
+                await message.reply_video(
+                    video=video,
+                    caption=(result["title"] or "Видео")[:1024],
+                    supports_streaming=True,
+                    read_timeout=180,
+                    write_timeout=180,
+                    connect_timeout=30,
+                    pool_timeout=30,
+                )
+            await status.delete()
+    except yt_dlp.utils.DownloadError as exc:
+        logger.warning("DownloadError: %s", str(exc)[:1500])
+        await status.edit_text("❌ " + friendly_error(exc))
+    except Exception as exc:
+        logger.exception("Request failed")
         try:
-            os.remove(final_path)
-            if final_path != filepath and os.path.exists(filepath):
-                os.remove(filepath)
-        except:
+            await status.edit_text("❌ " + friendly_error(exc))
+        except Exception:
             pass
-            
-    except Exception as e:
-        logger.exception("处理失败")
-        await status_msg.edit_text(f"❌ 出错：{str(e)[:200]}")
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"更新 {update} 导致错误 {context.error}")
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled Telegram error: %s", context.error)
 
-
-# ================= 启动 =================
 
 def main():
     if not BOT_TOKEN:
-        raise ValueError("请设置环境变量 BOT_TOKEN")
-    
+        raise RuntimeError("Set BOT_TOKEN in Railway Variables.")
+
+    logger.info("Starting bot; yt-dlp version=%s", yt_dlp.version.__version__)
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
     app.add_error_handler(error_handler)
-    
-    logger.info("机器人启动...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
